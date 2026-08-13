@@ -1,0 +1,36 @@
+{
+  "name": "@shawnhamby/pi-debug",
+  "version": "0.1.0",
+  "description": "Host-controlled Debug Adapter Protocol tools for Pi",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "debug-adapter-protocol", "dap"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shawnhamby/pi-debug.git"
+  },
+  "files": ["src/", "LICENSE", "NOTICE.md", "README.md", "UPSTREAM.md"],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": []
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.84.1",
+    "@earendil-works/pi-coding-agent": ">=0.84.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "26.1.2",
+    "typescript": "6.0.3"
+  },
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "packageManager": "pnpm@11.20.0"
+}
