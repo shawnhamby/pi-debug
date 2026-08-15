@@ -108,6 +108,12 @@ export class DapClient {
     }
   }
 
+  static async connectOwnedTarget(parent: DapClient): Promise<DapClient> {
+    if (parent.port === undefined) throw new Error("DAP adapter does not expose an owned loopback target endpoint");
+    const socket = await connectLoopback(parent.port, parent.child);
+    return new DapClient(parent.spec, parent.child, socket, socket, parent.port, false);
+  }
+
   onEvent(handler: (event: DapEvent) => void): void {
     this.protocol.on("event", handler);
   }

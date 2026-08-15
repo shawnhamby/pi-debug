@@ -18,10 +18,15 @@ const COMMAND_FIELDS = new Set([
 function executableOnPath(name: string, pathValue = process.env.PATH ?? ""): string | null {
   for (const directory of pathValue.split(path.delimiter)) {
     if (!directory) continue;
-    const candidate = path.join(directory, name);
+    const candidate = path.resolve(directory, name);
     try {
+      const target = fs.realpathSync(candidate);
+      if (!fs.statSync(target).isFile()) continue;
       fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
+      // Preserve the selected PATH spelling. Python uses the invoked venv
+      // symlink to discover pyvenv.cfg; returning its realpath silently drops
+      // the environment that owns debugpy.
+      return candidate;
     } catch {
       // Continue to the next PATH entry.
     }
@@ -153,6 +158,9 @@ function javascriptAdapter(request: PreparedLaunch, options: DebugExtensionOptio
 }
 
 function lldbAdapter(request: PreparedLaunch, options: DebugExtensionOptions): AdapterSpec {
+  if (path.extname(request.program).toLowerCase() === ".rs") {
+    throw new Error("lldb-dap requires a compiled executable, not a Rust source file");
+  }
   const lldb = options.resolveLldbDap?.() ?? defaultLldbDap();
   if (!lldb) throw new Error("adapter prerequisite is unavailable: lldb-dap");
   return {
@@ -204,6 +212,18 @@ function wasmtimeAdapter(request: PreparedLaunch, options: DebugExtensionOptions
   const module = request.module ?? request.program;
   if (path.extname(module).toLowerCase() !== ".wasm") throw new Error("Wasmtime debugging requires a .wasm module");
   assertWithin(request.workspaceRoot, module, "Wasmtime module");
+  let compiled: WebAssembly.Module;
+  try {
+    compiled = new WebAssembly.Module(fs.readFileSync(module));
+  } catch {
+    throw new Error("Wasmtime debugging requires a valid WebAssembly module");
+  }
+  const requiredDwarfSections = [".debug_info", ".debug_abbrev", ".debug_line"];
+  const missing = requiredDwarfSections.filter((name) =>
+    !WebAssembly.Module.customSections(compiled, name).some((section) => section.byteLength > 0));
+  if (missing.length) {
+    throw new Error(`Wasmtime debugging requires guest DWARF sections: missing ${missing.join(", ")}`);
+  }
   const wasmtime = requireExecutable("wasmtime");
   const lldb = options.resolveLldbDap?.() ?? defaultLldbDap();
   if (!lldb) throw new Error("adapter prerequisite is unavailable: lldb-dap");

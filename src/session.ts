@@ -14,6 +14,7 @@ import type {
   DapThread,
   DapVariable,
   DebugSessionSummary,
+  InitialBreakpoint,
   OwnedProcess,
 } from "./types.ts";
 
@@ -26,9 +27,17 @@ type PromiseOutcome<T> =
   | { ok: true; value: T }
   | { ok: false; error: Error };
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+};
+
 type DebugSession = {
   id: string;
   client: DapClient;
+  rootClient: DapClient;
+  connections: Set<DapClient>;
   spec: AdapterSpec;
   status: SessionStatus;
   launchedAt: number;
@@ -41,6 +50,11 @@ type DebugSession = {
   owned: Set<OwnedProcess>;
   cleanup?: Promise<void>;
   capabilities: DapCapabilities;
+  initialBreakpoints: InitialBreakpoint[];
+  reverseReady?: Deferred<void>;
+  reverseStarted: boolean;
+  reverseStop?: Promise<PromiseOutcome<DapEvent>>;
+  launchSignal?: AbortSignal;
 };
 
 function responseBody<T>(response: { body?: unknown }): T {
@@ -56,6 +70,38 @@ function supervise<T>(promise: Promise<T>): Promise<PromiseOutcome<T>> {
     (value) => ({ ok: true, value }),
     (error) => ({ ok: false, error: errorFrom(error) }),
   );
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function waitFor<T>(promise: Promise<T>, timeoutMs: number, signal: AbortSignal, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const settle = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => settle(() => reject(errorFrom(signal.reason)));
+    timer = setTimeout(() => settle(() => reject(new Error(`${label} timed out`))), timeoutMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    promise.then(
+      (value) => settle(() => resolve(value)),
+      (error) => settle(() => reject(errorFrom(error))),
+    );
+  });
 }
 
 function outcomeValue<T>(outcome: PromiseOutcome<T>): T {
@@ -105,15 +151,21 @@ export class DebugSessionManager {
     return session ? this.#summary(session) : null;
   }
 
-  async launch(spec: AdapterSpec, env: Record<string, string>, signal?: AbortSignal): Promise<DebugSessionSummary> {
+  async launch(
+    spec: AdapterSpec,
+    env: Record<string, string>,
+    signal?: AbortSignal,
+    initialBreakpoints: InitialBreakpoint[] = [],
+  ): Promise<DebugSessionSummary> {
     if ([...this.#sessions.values()].some((session) => session.status !== "terminated")) {
       throw new Error("A debug session is already active; terminate it before launching another target");
     }
     const client = await DapClient.spawn(spec, env);
     const session = this.#createSession(client, spec);
+    session.initialBreakpoints = initialBreakpoints;
     let launchError: Error | undefined;
     try {
-      await this.#initializeAndLaunch(session, spec.launch, signal);
+      await this.#initializeAndLaunch(session, spec.launch, initialBreakpoints, signal);
       this.#activeId = session.id;
       this.#publish();
       return this.#summary(session);
@@ -235,10 +287,12 @@ export class DebugSessionManager {
   async #initializeAndLaunch(
     session: DebugSession,
     launch: Record<string, unknown>,
+    initialBreakpoints: InitialBreakpoint[],
     signal?: AbortSignal,
   ): Promise<void> {
     signal?.throwIfAborted();
-    const initialize = await session.client.protocol.request("initialize", {
+    const root = session.rootClient;
+    const initialize = await root.protocol.request("initialize", {
       clientID: "pi-debug",
       clientName: "Pi",
       adapterID: session.spec.id,
@@ -247,26 +301,38 @@ export class DebugSessionManager {
       pathFormat: "path",
       supportsVariableType: true,
       supportsRunInTerminalRequest: false,
-      supportsStartDebuggingRequest: false,
+      supportsStartDebuggingRequest: session.spec.id === "vscode-js-debug",
     }, START_TIMEOUT_MS);
     session.capabilities = responseBody<DapCapabilities>(initialize);
     const handshakeController = new AbortController();
     const handshakeSignal = signal ? AbortSignal.any([signal, handshakeController.signal]) : handshakeController.signal;
+    session.launchSignal = handshakeSignal;
     try {
-      const initialized = supervise(session.client.protocol.waitForEvent("initialized", START_TIMEOUT_MS, handshakeSignal));
-      const stopped = supervise(session.client.protocol.waitForEvent("stopped", START_TIMEOUT_MS, handshakeSignal));
-      const launched = supervise(session.client.protocol.request("launch", launch, START_TIMEOUT_MS));
+      const initialized = supervise(root.protocol.waitForEvent("initialized", START_TIMEOUT_MS, handshakeSignal));
+      const stopped = supervise(root.protocol.waitForEvent("stopped", START_TIMEOUT_MS, handshakeSignal));
+      const reverseReady = session.reverseReady
+        ? supervise(waitFor(session.reverseReady.promise, START_TIMEOUT_MS, handshakeSignal, "vscode-js-debug owned target"))
+        : undefined;
+      const launched = supervise(root.protocol.request("launch", launch, START_TIMEOUT_MS));
       const initializedOutcome = await Promise.race([
         initialized,
         launched.then((outcome) => outcome.ok ? initialized : outcome),
       ]);
       outcomeValue(initializedOutcome);
+      if (session.spec.id !== "vscode-js-debug") {
+        await this.#setInitialBreakpoints(session, root, initialBreakpoints);
+      }
       if (session.capabilities.supportsConfigurationDoneRequest !== false) {
-        await session.client.protocol.request("configurationDone", {}, START_TIMEOUT_MS);
+        await root.protocol.request("configurationDone", {}, START_TIMEOUT_MS);
       }
       outcomeValue(await launched);
+      if (session.spec.id === "vscode-js-debug") {
+        if (!reverseReady) throw new Error("vscode-js-debug reverse target state is unavailable");
+        outcomeValue(await reverseReady);
+        if (!session.reverseStop) throw new Error("vscode-js-debug did not initialize its owned target");
+      }
       const stopOutcome = await Promise.race([
-        stopped,
+        session.spec.id === "vscode-js-debug" ? session.reverseStop! : stopped,
         new Promise<PromiseOutcome<null>>((resolve) => setTimeout(() => resolve({ ok: true, value: null }), 2000)),
       ]);
       const stopEvent = stopOutcome.ok ? stopOutcome.value : null;
@@ -274,6 +340,41 @@ export class DebugSessionManager {
       this.#publish();
     } finally {
       handshakeController.abort(new Error("DAP launch handshake settled"));
+      session.launchSignal = undefined;
+    }
+  }
+
+  async #setInitialBreakpoints(
+    session: DebugSession,
+    client: DapClient,
+    requested: InitialBreakpoint[],
+  ): Promise<void> {
+    const bySource = new Map<string, number[]>();
+    for (const breakpoint of requested) {
+      if (!Number.isInteger(breakpoint.line) || breakpoint.line < 1) {
+        throw new Error(`breakpoint line must be a positive integer: ${breakpoint.line}`);
+      }
+      if (!within(session.spec.workspaceRoot, breakpoint.file)) {
+        throw new Error(`breakpoint file is outside the active workspace: ${breakpoint.file}`);
+      }
+      const source = fs.realpathSync(breakpoint.file);
+      const lines = bySource.get(source) ?? [];
+      if (!lines.includes(breakpoint.line)) lines.push(breakpoint.line);
+      bySource.set(source, lines);
+    }
+    for (const [source, lines] of bySource) {
+      lines.sort((left, right) => left - right);
+      const response = await client.protocol.request("setBreakpoints", {
+        source: { path: source },
+        breakpoints: lines.map((line) => ({ line })),
+        sourceModified: false,
+      }, START_TIMEOUT_MS);
+      const reported = responseBody<{ breakpoints?: DapBreakpoint[] }>(response).breakpoints ?? [];
+      session.breakpoints.set(source, lines.map((line, index) => ({
+        line,
+        verified: reported[index]?.verified ?? false,
+        message: reported[index]?.message,
+      })));
     }
   }
 
@@ -281,6 +382,8 @@ export class DebugSessionManager {
     const session: DebugSession = {
       id: `debug-${this.#nextId++}`,
       client,
+      rootClient: client,
+      connections: new Set([client]),
       spec,
       status: "launching",
       launchedAt: Date.now(),
@@ -290,15 +393,69 @@ export class DebugSessionManager {
       breakpoints: new Map(),
       owned: new Set(client.ownsProcess ? [{ child: client.child, command: spec.command }] : []),
       capabilities: {},
+      initialBreakpoints: [],
+      ...(spec.id === "vscode-js-debug" ? { reverseReady: deferred<void>() } : {}),
+      reverseStarted: false,
     };
     this.#sessions.set(session.id, session);
-    client.onEvent((event) => this.#handleEvent(session, event));
-    client.onRequest((request) => { void this.#handleReverseRequest(session, request); });
+    this.#wireClient(session, client);
     return session;
   }
 
-  async #handleReverseRequest(session: DebugSession, request: DapRequest): Promise<void> {
-    await session.client.protocol.respond(request, false, undefined, `Reverse request is not supported: ${request.command}`);
+  #wireClient(session: DebugSession, client: DapClient): void {
+    client.onEvent((event) => this.#handleEvent(session, event));
+    client.onRequest((request) => { void this.#handleReverseRequest(session, client, request); });
+  }
+
+  async #handleReverseRequest(session: DebugSession, source: DapClient, request: DapRequest): Promise<void> {
+    if (request.command !== "startDebugging" || session.spec.id !== "vscode-js-debug" ||
+        source !== session.rootClient || session.status !== "launching" || session.reverseStarted) {
+      await source.protocol.respond(request, false, undefined, `Reverse request is not supported: ${request.command}`);
+      return;
+    }
+    session.reverseStarted = true;
+    try {
+      const args = request.arguments as { request?: unknown; configuration?: unknown } | undefined;
+      const configuration = args?.configuration;
+      if (args?.request !== "launch" || !configuration || typeof configuration !== "object" || Array.isArray(configuration)) {
+        throw new Error("startDebugging must describe the owned initial launch target");
+      }
+      const config = configuration as Record<string, unknown>;
+      const keys = Object.keys(config);
+      if (keys.some((key) => !["type", "name", "__pendingTargetId"].includes(key)) ||
+          config.type !== "pwa-node" || typeof config.name !== "string" ||
+          typeof config.__pendingTargetId !== "string" || !config.__pendingTargetId) {
+        throw new Error("startDebugging target is outside the owned initial Node session");
+      }
+      const target = await DapClient.connectOwnedTarget(session.rootClient);
+      session.connections.add(target);
+      this.#wireClient(session, target);
+      const initialized = supervise(target.protocol.waitForEvent("initialized", START_TIMEOUT_MS));
+      await target.protocol.request("initialize", {
+        clientID: "pi-debug",
+        clientName: "Pi",
+        adapterID: session.spec.id,
+        linesStartAt1: true,
+        columnsStartAt1: true,
+        pathFormat: "path",
+        supportsVariableType: true,
+        supportsRunInTerminalRequest: false,
+        supportsStartDebuggingRequest: false,
+      }, START_TIMEOUT_MS);
+      outcomeValue(await initialized);
+      session.reverseStop = supervise(target.protocol.waitForEvent("stopped", START_TIMEOUT_MS, session.launchSignal));
+      const reverseLaunch = supervise(target.protocol.request("launch", config, START_TIMEOUT_MS));
+      await this.#setInitialBreakpoints(session, target, session.initialBreakpoints);
+      await target.protocol.request("configurationDone", {}, START_TIMEOUT_MS);
+      outcomeValue(await reverseLaunch);
+      session.client = target;
+      session.reverseReady?.resolve();
+      await source.protocol.respond(request, true);
+    } catch (error) {
+      session.reverseReady?.reject(errorFrom(error));
+      session.reverseStop = Promise.resolve({ ok: false, error: errorFrom(error) });
+      await source.protocol.respond(request, false, undefined, errorFrom(error).message);
+    }
   }
 
   #handleEvent(session: DebugSession, event: DapEvent): void {
@@ -335,12 +492,19 @@ export class DebugSessionManager {
   async #resume(command: "continue" | "next" | "stepIn" | "stepOut", signal?: AbortSignal, timeoutMs = 30_000): Promise<DebugSessionSummary> {
     const session = this.#requiredActive();
     const thread = await this.#primaryThread(session);
-    const stopped = session.client.protocol.waitForEvent("stopped", timeoutMs, signal).catch(() => null);
-    const terminated = session.client.protocol.waitForEvent("terminated", timeoutMs, signal).catch(() => null);
-    session.status = "running";
-    await session.client.protocol.request(command, { threadId: thread.id, singleThread: false }, timeoutMs);
-    await Promise.race([stopped, terminated]);
-    return this.#summary(session);
+    const settled = new AbortController();
+    const waitSignal = signal ? AbortSignal.any([signal, settled.signal]) : settled.signal;
+    try {
+      const stopped = session.client.protocol.waitForEvent("stopped", timeoutMs, waitSignal).catch(() => null);
+      const terminated = session.client.protocol.waitForEvent("terminated", timeoutMs, waitSignal).catch(() => null);
+      const exited = session.client.protocol.waitForEvent("exited", timeoutMs, waitSignal).catch(() => null);
+      session.status = "running";
+      await session.client.protocol.request(command, { threadId: thread.id, singleThread: false }, timeoutMs);
+      await Promise.race([stopped, terminated, exited]);
+      return this.#summary(session);
+    } finally {
+      settled.abort(new Error("DAP resume settled"));
+    }
   }
 
   async #primaryThread(session: DebugSession): Promise<DapThread> {
@@ -365,7 +529,7 @@ export class DebugSessionManager {
       }
     }
     await this.#cleanupOwned(session);
-    session.client.protocol.close();
+    for (const connection of session.connections) connection.protocol.close();
     session.status = "terminated";
     this.#publish();
   }

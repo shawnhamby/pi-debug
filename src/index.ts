@@ -92,6 +92,10 @@ export function createDebugExtension(options: DebugExtensionOptions) {
         ])),
         cwd: Type.Optional(Type.String()),
         module: Type.Optional(Type.String({ description: "Workspace .wasm module for wasmtime-lldb" })),
+        breakpoints: Type.Optional(Type.Array(Type.Object({
+          file: Type.String({ description: "Workspace source path" }),
+          line: Type.Integer({ minimum: 1 }),
+        }), { description: "Source breakpoints configured before the initial target starts" })),
         file: Type.Optional(Type.String()),
         line: Type.Optional(Type.Integer({ minimum: 1 })),
         levels: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -106,6 +110,7 @@ export function createDebugExtension(options: DebugExtensionOptions) {
         adapter?: AdapterId;
         cwd?: string;
         module?: string;
+        breakpoints?: Array<{ file: string; line: number }>;
         file?: string;
         line?: number;
         levels?: number;
@@ -127,7 +132,11 @@ export function createDebugExtension(options: DebugExtensionOptions) {
               ...(params.module ? { module: path.resolve(cwd, params.module) } : {}),
             });
             const spec = resolveAdapter(prepared, prepared.adapter, options);
-            return textResult(formatSummary(await manager.launch(spec, prepared.env, signal)), { action: params.action });
+            const breakpoints = (params.breakpoints ?? []).map((entry) => ({
+              file: path.resolve(cwd, entry.file),
+              line: entry.line,
+            }));
+            return textResult(formatSummary(await manager.launch(spec, prepared.env, signal, breakpoints)), { action: params.action });
           }
           case "set_breakpoint": {
             if (!params.file || params.line === undefined) throw new Error("set_breakpoint requires file and line");
@@ -178,4 +187,4 @@ export function createDebugExtension(options: DebugExtensionOptions) {
   };
 }
 
-export type { AdapterId, DebugAction, DebugExtensionOptions, DebugSessionSummary, PreparedLaunch } from "./types.ts";
+export type { AdapterId, DebugAction, DebugExtensionOptions, DebugSessionSummary, InitialBreakpoint, PreparedLaunch } from "./types.ts";
