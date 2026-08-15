@@ -72,7 +72,7 @@ function javascriptSpec(root: string, mode: string, traceFile: string): AdapterS
   };
 }
 
-test("js-debug launches its one owned reverse target and configures initial breakpoints first", async () => {
+test("breakpoints preserve source identity before and after launch", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-debug-js-reverse-"));
   const traceFile = path.join(root, "trace.txt");
   const manager = new DebugSessionManager();
@@ -83,8 +83,12 @@ test("js-debug launches its one owned reverse target and configures initial brea
     ]);
     assert.equal(summary.status, "stopped");
     assert.deepEqual((await manager.threads()).threads, [{ id: 1, name: "main" }]);
+    await manager.setBreakpoint(spec.program, 1);
     const trace = fs.readFileSync(traceFile, "utf8").trim().split("\n");
-    assert.ok(trace.indexOf("target:setBreakpoints") < trace.indexOf("target:configurationDone"), trace.join(", "));
+    const source = JSON.stringify({ name: "program.js", path: spec.program });
+    const breakpointTrace = `target:setBreakpoints:${source}`;
+    assert.equal(trace.filter((entry) => entry === breakpointTrace).length, 2, trace.join(", "));
+    assert.ok(trace.indexOf(breakpointTrace) < trace.indexOf("target:configurationDone"), trace.join(", "));
   } finally {
     await manager.shutdown();
     fs.rmSync(root, { recursive: true, force: true });

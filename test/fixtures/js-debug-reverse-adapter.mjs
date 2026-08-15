@@ -58,7 +58,12 @@ function handle(socket, role, message) {
     return;
   }
   if (message.type !== "request") return;
-  writeTrace(role, message.command);
+  writeTrace(
+    role,
+    message.command === "setBreakpoints"
+      ? `${message.command}:${JSON.stringify(message.arguments?.source ?? {})}`
+      : message.command,
+  );
   switch (message.command) {
     case "initialize":
       response(socket, message, true, {
