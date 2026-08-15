@@ -103,6 +103,10 @@ test("wasmtime rejects stripped modules and admits modules with core guest DWARF
     );
     const spec = resolveAdapter(prepared(debug), "wasmtime-lldb", options);
     assert.equal(spec.id, "wasmtime-lldb");
+    assert.deepEqual(spec.args, process.platform === "darwin" ? [
+      "--pre-init-command",
+      "settings set plugin.jit-loader.gdb.enable on",
+    ] : []);
     assert.deepEqual(spec.programArgs.slice(0, 3), ["-D", "debug-info", debug]);
   } finally {
     process.env.PATH = previousPath;

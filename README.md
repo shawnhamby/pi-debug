@@ -23,7 +23,16 @@ The Node route admits vscode-js-debug's single loopback `startDebugging`
 request for the initial policy-approved target. Additional targets, child
 expansion, and execution-bearing reverse configuration remain rejected. The
 Wasmtime route requires guest DWARF `.debug_info`, `.debug_abbrev`, and
-`.debug_line` sections before either process starts.
+`.debug_line` sections before either process starts. It starts `lldb-dap` with
+Wasmtime's documented macOS GDB JIT loader setting enabled through one fixed
+pre-initialization command so pending guest source breakpoints resolve when the
+JIT image loads. This command is package-owned and cannot be supplied or
+changed by a model, repository, or launch request. See Wasmtime's official
+[native debugger guidance](https://docs.wasmtime.dev/examples-debugging-native-debugger.html).
+On the admitted macOS LLDB 21/22 toolchains, guest breakpoints, stack frames,
+scopes, and variables work, but source stepping can re-stop on the same JIT
+breakpoint. Wasmtime's portable guest-debug route requires LLDB 32 or newer, so
+the Wasmtime profile does not promise reliable source stepping on this host.
 
 Attach, remote targets, arbitrary evaluation, memory access, custom DAP
 requests, debugger command arrays, GDB, CodeLLDB, public listeners, adapter
