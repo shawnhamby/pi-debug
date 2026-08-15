@@ -124,6 +124,10 @@ function within(root: string, candidate: string): boolean {
   }
 }
 
+function sourceDescriptor(source: string): { name: string; path: string } {
+  return { name: path.basename(source), path: source };
+}
+
 function appendOutput(session: DebugSession, text: string): void {
   if (!text) return;
   session.outputBytes += Buffer.byteLength(text, "utf8");
@@ -189,12 +193,12 @@ export class DebugSessionManager {
   async setBreakpoint(file: string, line: number): Promise<{ summary: DebugSessionSummary; breakpoints: BreakpointRecord[] }> {
     const session = this.#requiredActive();
     if (!within(session.spec.workspaceRoot, file)) throw new Error(`breakpoint file is outside the active workspace: ${file}`);
-    const source = fs.realpathSync(file);
+    const source = path.resolve(file);
     const current = session.breakpoints.get(source) ?? [];
     const next = [...current.filter((entry) => entry.line !== line), { line, verified: false }]
       .sort((left, right) => left.line - right.line);
     const response = await session.client.protocol.request("setBreakpoints", {
-      source: { path: source },
+      source: sourceDescriptor(source),
       breakpoints: next.map((entry) => ({ line: entry.line })),
       sourceModified: false,
     });
@@ -211,10 +215,10 @@ export class DebugSessionManager {
   async removeBreakpoint(file: string, line: number): Promise<{ summary: DebugSessionSummary; breakpoints: BreakpointRecord[] }> {
     const session = this.#requiredActive();
     if (!within(session.spec.workspaceRoot, file)) throw new Error(`breakpoint file is outside the active workspace: ${file}`);
-    const source = fs.realpathSync(file);
+    const source = path.resolve(file);
     const next = (session.breakpoints.get(source) ?? []).filter((entry) => entry.line !== line);
     const response = await session.client.protocol.request("setBreakpoints", {
-      source: { path: source },
+      source: sourceDescriptor(source),
       breakpoints: next.map((entry) => ({ line: entry.line })),
       sourceModified: false,
     });
@@ -357,7 +361,7 @@ export class DebugSessionManager {
       if (!within(session.spec.workspaceRoot, breakpoint.file)) {
         throw new Error(`breakpoint file is outside the active workspace: ${breakpoint.file}`);
       }
-      const source = fs.realpathSync(breakpoint.file);
+      const source = path.resolve(breakpoint.file);
       const lines = bySource.get(source) ?? [];
       if (!lines.includes(breakpoint.line)) lines.push(breakpoint.line);
       bySource.set(source, lines);
@@ -365,7 +369,7 @@ export class DebugSessionManager {
     for (const [source, lines] of bySource) {
       lines.sort((left, right) => left - right);
       const response = await client.protocol.request("setBreakpoints", {
-        source: { path: source },
+        source: sourceDescriptor(source),
         breakpoints: lines.map((line) => ({ line })),
         sourceModified: false,
       }, START_TIMEOUT_MS);
