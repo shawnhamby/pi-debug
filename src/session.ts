@@ -19,7 +19,12 @@ import type {
 
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const START_TIMEOUT_MS = 30_000;
+const MAX_LAUNCH_ERROR_LENGTH = 1000;
 type SessionStatus = DebugSessionSummary["status"];
+
+type PromiseOutcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: Error };
 
 type DebugSession = {
   id: string;
@@ -40,6 +45,28 @@ type DebugSession = {
 
 function responseBody<T>(response: { body?: unknown }): T {
   return (response.body ?? {}) as T;
+}
+
+function errorFrom(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function supervise<T>(promise: Promise<T>): Promise<PromiseOutcome<T>> {
+  return promise.then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error: errorFrom(error) }),
+  );
+}
+
+function outcomeValue<T>(outcome: PromiseOutcome<T>): T {
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
+}
+
+function boundedLaunchError(error: unknown): Error {
+  const message = errorFrom(error).message;
+  const suffix = message.length > MAX_LAUNCH_ERROR_LENGTH ? "..." : "";
+  return new Error(`DAP launch failed: ${message.slice(0, MAX_LAUNCH_ERROR_LENGTH)}${suffix}`);
 }
 
 function within(root: string, candidate: string): boolean {
@@ -84,15 +111,27 @@ export class DebugSessionManager {
     }
     const client = await DapClient.spawn(spec, env);
     const session = this.#createSession(client, spec);
+    let launchError: Error | undefined;
     try {
       await this.#initializeAndLaunch(session, spec.launch, signal);
       this.#activeId = session.id;
       this.#publish();
       return this.#summary(session);
     } catch (error) {
-      await this.#terminateSession(session);
-      throw error;
+      launchError = boundedLaunchError(error);
+    } finally {
+      if (launchError) {
+        try {
+          await this.#terminateSession(session);
+        } catch (cleanupError) {
+          launchError = boundedLaunchError(new AggregateError([launchError, cleanupError], "launch and cleanup failed"));
+        }
+        if (this.#activeId === session.id) this.#activeId = null;
+        this.#sessions.delete(session.id);
+        this.#publish();
+      }
     }
+    throw launchError;
   }
 
   async setBreakpoint(file: string, line: number): Promise<{ summary: DebugSessionSummary; breakpoints: BreakpointRecord[] }> {
@@ -211,20 +250,31 @@ export class DebugSessionManager {
       supportsStartDebuggingRequest: false,
     }, START_TIMEOUT_MS);
     session.capabilities = responseBody<DapCapabilities>(initialize);
-    const initialized = session.client.protocol.waitForEvent("initialized", START_TIMEOUT_MS, signal);
-    const stopped = session.client.protocol.waitForEvent("stopped", START_TIMEOUT_MS, signal).catch(() => null);
-    const launched = session.client.protocol.request("launch", launch, START_TIMEOUT_MS);
-    await initialized;
-    if (session.capabilities.supportsConfigurationDoneRequest !== false) {
-      await session.client.protocol.request("configurationDone", {}, START_TIMEOUT_MS);
+    const handshakeController = new AbortController();
+    const handshakeSignal = signal ? AbortSignal.any([signal, handshakeController.signal]) : handshakeController.signal;
+    try {
+      const initialized = supervise(session.client.protocol.waitForEvent("initialized", START_TIMEOUT_MS, handshakeSignal));
+      const stopped = supervise(session.client.protocol.waitForEvent("stopped", START_TIMEOUT_MS, handshakeSignal));
+      const launched = supervise(session.client.protocol.request("launch", launch, START_TIMEOUT_MS));
+      const initializedOutcome = await Promise.race([
+        initialized,
+        launched.then((outcome) => outcome.ok ? initialized : outcome),
+      ]);
+      outcomeValue(initializedOutcome);
+      if (session.capabilities.supportsConfigurationDoneRequest !== false) {
+        await session.client.protocol.request("configurationDone", {}, START_TIMEOUT_MS);
+      }
+      outcomeValue(await launched);
+      const stopOutcome = await Promise.race([
+        stopped,
+        new Promise<PromiseOutcome<null>>((resolve) => setTimeout(() => resolve({ ok: true, value: null }), 2000)),
+      ]);
+      const stopEvent = stopOutcome.ok ? stopOutcome.value : null;
+      session.status = stopEvent ? "stopped" : "running";
+      this.#publish();
+    } finally {
+      handshakeController.abort(new Error("DAP launch handshake settled"));
     }
-    await launched;
-    const stopEvent = await Promise.race([
-      stopped,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
-    ]);
-    session.status = stopEvent ? "stopped" : "running";
-    this.#publish();
   }
 
   #createSession(client: DapClient, spec: AdapterSpec): DebugSession {
