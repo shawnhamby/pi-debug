@@ -128,6 +128,11 @@ export interface PreparedLaunchRequest {
   module?: string;
 }
 
+export interface InitialBreakpoint {
+  file: string;
+  line: number;
+}
+
 export interface PreparedLaunch extends PreparedLaunchRequest {
   workspaceRoot: string;
   env: Record<string, string>;
