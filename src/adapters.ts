@@ -15,6 +15,11 @@ const COMMAND_FIELDS = new Set([
   "postRunCommands",
 ]);
 
+const WASMTIME_MACOS_JIT_LOADER_ARGS = [
+  "--pre-init-command",
+  "settings set plugin.jit-loader.gdb.enable on",
+];
+
 function executableOnPath(name: string, pathValue = process.env.PATH ?? ""): string | null {
   for (const directory of pathValue.split(path.delimiter)) {
     if (!directory) continue;
@@ -230,7 +235,7 @@ function wasmtimeAdapter(request: PreparedLaunch, options: DebugExtensionOptions
   return {
     id: "wasmtime-lldb",
     command: lldb,
-    args: [],
+    args: process.platform === "darwin" ? WASMTIME_MACOS_JIT_LOADER_ARGS : [],
     transport: "stdio",
     program: wasmtime,
     programArgs: ["-D", "debug-info", module, ...request.args],
