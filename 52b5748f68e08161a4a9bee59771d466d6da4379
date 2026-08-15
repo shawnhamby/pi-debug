@@ -1,0 +1,1 @@
+Adversarial review: PASS\nReviewer: grok:high via Grok Build\nFrozen diff SHA-256: 4e861eac2804b07db1a338c3aa702f05ee49852f774b5576b6eb7abdd601bdb7\nVerification: focused tests 5/5; typecheck; diff check; public LLDB acceptance
